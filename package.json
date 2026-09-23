@@ -1,0 +1,29 @@
+{
+  "name": "jevascript",
+  "version": "0.1.0",
+  "description": "Semantic values for deterministic TypeScript: is, score and choose as ordinary values, backed by a decision model.",
+  "license": "MIT",
+  "homepage": "https://jevascript.org",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": { "node": ">=22.6" },
+  "keywords": ["llm", "semantic", "decision-model", "jev", "typescript", "classification", "scoring"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "npm run build && tsc -p tsconfig.test.json",
+    "test": "npm run typecheck && node --test test/*.test.ts",
+    "example": "node --env-file=.env --experimental-strip-types",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
