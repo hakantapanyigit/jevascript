@@ -10,8 +10,8 @@ export type JsonValue =
   | number
   | boolean
   | null
-  | JsonValue[]
-  | { [key: string]: JsonValue }
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue }
 
 /**
  * What gets evaluated. Providers accept text only, so objects are serialised

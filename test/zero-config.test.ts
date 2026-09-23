@@ -18,13 +18,24 @@ describe("zero configuration", () => {
   it("builds the default provider from the environment on first use", async () => {
     process.env["JEV_API_KEY"] = "apikey_test"
     process.env["JEV_MODEL"] = "jev-test-model"
+    // The provider is built lazily and picks up the global fetch then, so a
+    // stub here keeps the test off the network entirely.
+    const realFetch = globalThis.fetch
+    const seen: { url: string; authorization: string | undefined; model: unknown }[] = []
+    globalThis.fetch = (async (url: string, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>
+      seen.push({ url, authorization: headers["authorization"], model: JSON.parse(String(init.body)).model })
+      return new Response(JSON.stringify({ answers: { q0: { noul: 0.9 } } }), { status: 200 })
+    }) as typeof globalThis.fetch
     try {
-      const context = semantic({ a: 1 })
-      // The call fails at the network, which is after provider resolution.
-      await context.is("anything", { timeoutMs: 1 }).catch(() => undefined)
+      assert.equal(await semantic({ a: 1 }).is("anything"), true)
       assert.equal(getConfig().provider?.name, "jev")
       assert.equal(getConfig().provider?.model, "jev-test-model")
+      assert.deepEqual(seen, [
+        { url: "https://api.typesafe.ai/v1/systemone", authorization: "Bearer apikey_test", model: "jev-test-model" },
+      ])
     } finally {
+      globalThis.fetch = realFetch
       delete process.env["JEV_MODEL"]
     }
   })

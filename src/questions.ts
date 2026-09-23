@@ -54,6 +54,61 @@ export interface ChooseOptions extends SharedOptions {
   fallback?: string | (() => string | Promise<string>)
 }
 
+// ---------------------------------------------------------------------------
+// Result types. The options decide the shape, so the type has to follow them:
+// `allowUnknown` adds "unknown", `detailed` returns the evidence alongside.
+// When a flag is not known at compile time, the type is the union of both.
+// ---------------------------------------------------------------------------
+
+export interface DetailedTruth<V extends boolean | "unknown" = boolean> {
+  value: V
+  /** The calibrated signal. For truth-backed answers this *is* the uncertainty. */
+  probability: number
+  /** Measured across sample rounds. Undefined unless `samples`/`minConfidence` was set. */
+  confidence?: number
+}
+
+export interface DetailedScore {
+  value: number
+  probability?: number
+  /** Rubric position, **0-indexed** and possibly between levels. Present only for `levels`-backed scores. */
+  level?: number
+  confidence?: number
+}
+
+export interface DetailedChoice<T extends string> {
+  value: T
+  confidence: number
+  probabilities: Record<string, number>
+}
+
+/**
+ * The type of flag `F` in options `O`: "off" when absent or false, "on" when
+ * literally true, "either" when only known to be a boolean. Read through
+ * `keyof` rather than `O extends { flag?: false }`, because an all-optional
+ * target is a weak type and would reject `{ instructions: "…" }` outright.
+ */
+type Flag<O, F extends string> = F extends keyof O
+  ? [O[F]] extends [false | undefined]
+    ? "off"
+    : [O[F]] extends [true]
+      ? "on"
+      : "either"
+  : "off"
+
+type WithDetail<O, Plain, Rich> = {
+  off: Plain
+  on: Rich
+  either: Plain | Rich
+}[Flag<O, "detailed">]
+
+/** `boolean`, or `boolean | "unknown"` when the band may be reported. */
+export type TruthValue<O> = Flag<O, "allowUnknown"> extends "off" ? boolean : boolean | "unknown"
+export type IsResult<O> = WithDetail<O, TruthValue<O>, DetailedTruth<TruthValue<O>>>
+export type ScoreResult<O> = WithDetail<O, number, DetailedScore>
+export type ChooseResult<K extends string, O> = WithDetail<O, K, DetailedChoice<K>>
+export type ChoiceKey<T> = T extends readonly string[] ? T[number] : keyof T & string
+
 /**
  * Default framing that turns a noun-phrase criterion into a proposition.
  *
@@ -122,25 +177,21 @@ export function buildChoose(input: ChoiceInput, options: ChooseOptions = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone builders, for composing inside `batch()`.
+// Standalone builders, for composing inside `batch()`. They take the same
+// options as the context methods and resolve to exactly the same values.
 // ---------------------------------------------------------------------------
 
-export function is(condition: string, options: IsOptions = {}): QuestionSpec<boolean> {
-  return { build: () => buildIs(condition, options) }
+export function is<O extends IsOptions = {}>(condition: string, options?: O): QuestionSpec<IsResult<O>> {
+  return { build: () => buildIs(condition, options ?? {}) }
 }
 
-export function score(criterion: string, options: ScoreOptions = {}): QuestionSpec<number> {
-  return { build: (frame) => buildScore(criterion, options, frame) }
+export function score<O extends ScoreOptions = {}>(criterion: string, options?: O): QuestionSpec<ScoreResult<O>> {
+  return { build: (frame) => buildScore(criterion, options ?? {}, frame) }
 }
 
-export function choose<const T extends readonly string[]>(
+export function choose<const T extends ChoiceInput, O extends ChooseOptions = {}>(
   options: T,
-  extra?: ChooseOptions,
-): QuestionSpec<T[number]>
-export function choose<const T extends Readonly<Record<string, string | ChoiceOptionSpec>>>(
-  options: T,
-  extra?: ChooseOptions,
-): QuestionSpec<keyof T & string>
-export function choose(options: ChoiceInput, extra: ChooseOptions = {}): QuestionSpec<string> {
-  return { build: () => buildChoose(options, extra) }
+  extra?: O,
+): QuestionSpec<ChooseResult<ChoiceKey<T>, O>> {
+  return { build: () => buildChoose(options, extra ?? {}) }
 }

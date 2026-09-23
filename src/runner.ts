@@ -2,7 +2,7 @@ import { getCacheStore, getConfig, parseTtlOrUndefined } from "./internal.ts"
 import type { SemanticCache } from "./cache.ts"
 import type { SemanticConfig } from "./config.ts"
 import { hashKey } from "./cache.ts"
-import { UnsupportedByProviderError } from "./errors.ts"
+import { ProviderError, UnsupportedByProviderError } from "./errors.ts"
 import type {
   ChoiceAnswer,
   ChoiceQuestion,
@@ -35,11 +35,29 @@ export interface RunResult {
   requestCount: number
 }
 
-/** Stable stringify so cache keys survive key reordering. */
+/**
+ * What a cache entry holds: the aggregated answer, plus the confidence that was
+ * measured producing it. Without the latter a cached answer could never pass a
+ * `minConfidence` gate again.
+ */
+type CachedAnswer = SemanticAnswer & { readonly measuredConfidence?: number }
+
+/**
+ * Stable stringify so cache keys survive key reordering.
+ *
+ * It follows JSON semantics exactly — `toJSON`, dropped `undefined` — because
+ * the key must identify what the provider is actually sent. A `Date` that was
+ * walked as a plain object would key as `{}`, and every date would collide.
+ */
 function stable(value: unknown): string {
+  if (value !== null && typeof value === "object" && typeof (value as { toJSON?: unknown }).toJSON === "function") {
+    return stable((value as { toJSON: () => unknown }).toJSON())
+  }
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null"
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1))
+  if (Array.isArray(value)) return `[${value.map((v) => (v === undefined || typeof v === "function" || typeof v === "symbol" ? "null" : stable(v))).join(",")}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined && typeof v !== "function" && typeof v !== "symbol")
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stable(v)}`).join(",")}}`
 }
 
@@ -126,15 +144,15 @@ export function confidenceFromSpread(samples: readonly number[]): number {
   return Math.min(1, Math.max(0, 1 - 2 * stdev(samples)))
 }
 
-function aggregate(kind: SemanticQuestion["kind"], rounds: readonly SemanticAnswer[]): SemanticAnswer {
+function aggregate(question: SemanticQuestion, rounds: readonly SemanticAnswer[]): SemanticAnswer {
   if (rounds.length === 1) return rounds[0]!
-  if (kind === "truth") {
+  if (question.kind === "truth") {
     const ps = (rounds as TruthAnswer[]).map((r) => r.probability)
     return { kind: "truth", probability: mean(ps) }
   }
-  if (kind === "choice") {
+  if (question.kind === "choice") {
     const all = rounds as ChoiceAnswer[]
-    const keys = Object.keys(all[0]!.probabilities)
+    const keys = Object.keys(question.options)
     const averaged: Record<string, number> = {}
     for (const key of keys) averaged[key] = mean(all.map((r) => r.probabilities[key] ?? 0))
     return {
@@ -145,7 +163,7 @@ function aggregate(kind: SemanticQuestion["kind"], rounds: readonly SemanticAnsw
     }
   }
   const all = rounds as LevelAnswer[]
-  const width = all[0]!.probabilities.length
+  const width = question.levels.length
   const averaged: number[] = []
   for (let i = 0; i < width; i++) averaged.push(mean(all.map((r) => r.probabilities[i] ?? 0)))
   return {
@@ -157,13 +175,12 @@ function aggregate(kind: SemanticQuestion["kind"], rounds: readonly SemanticAnsw
 }
 
 /** Numeric series a measured confidence can be computed from, per kind. */
-function series(kind: SemanticQuestion["kind"], rounds: readonly SemanticAnswer[]): number[] {
-  if (kind === "truth") return (rounds as TruthAnswer[]).map((r) => r.probability)
-  if (kind === "level") {
+function series(question: SemanticQuestion, rounds: readonly SemanticAnswer[]): number[] {
+  if (question.kind === "truth") return (rounds as TruthAnswer[]).map((r) => r.probability)
+  if (question.kind === "level") {
     // Normalise rubric position onto 0–1 so the spread formula stays comparable.
-    const all = rounds as LevelAnswer[]
-    const width = Math.max(1, all[0]!.probabilities.length - 1)
-    return all.map((r) => r.level / width)
+    const width = Math.max(1, question.levels.length - 1)
+    return (rounds as LevelAnswer[]).map((r) => r.level / width)
   }
   const all = rounds as ChoiceAnswer[]
   const winner = argmax(all[0]!.probabilities)
@@ -175,7 +192,8 @@ function series(kind: SemanticQuestion["kind"], rounds: readonly SemanticAnswer[
  *
  * Round 0 carries every question. Later rounds carry only the questions that
  * asked for more samples, so raising `samples` on one question does not
- * multiply the cost of its neighbours.
+ * multiply the cost of its neighbours. Rounds are independent draws, so they
+ * run concurrently: sampling costs requests, not latency.
  */
 export async function runPlan(
   provider: SemanticProvider,
@@ -194,9 +212,11 @@ export async function runPlan(
   for (const item of planned) {
     assertSupported(provider, item.question)
     if (item.cacheTtlMs && item.cacheTtlMs > 0) {
-      const hit = await store.get(cacheKeyFor(provider, state, item.question, item.samples))
+      const hit = (await store.get(cacheKeyFor(provider, state, item.question, item.samples))) as CachedAnswer | undefined
       if (hit) {
-        answers[item.key] = hit
+        const { measuredConfidence, ...answer } = hit
+        answers[item.key] = answer as SemanticAnswer
+        measured[item.key] = measuredConfidence
         cachedKeys.add(item.key)
         continue
       }
@@ -207,38 +227,48 @@ export async function runPlan(
   let requestCount = 0
   if (live.length > 0) {
     const maxRounds = Math.max(...live.map((q) => q.samples))
-    const rounds: Record<string, SemanticAnswer[]> = {}
-    for (const item of live) rounds[item.key] = []
+    const rounds = Array.from({ length: maxRounds }, (_, round) => live.filter((q) => q.samples > round))
 
-    for (let round = 0; round < maxRounds; round++) {
-      const inRound = live.filter((q) => q.samples > round)
-      if (inRound.length === 0) break
-      const questions: Record<string, SemanticQuestion> = {}
-      for (const item of inRound) questions[item.key] = item.question
+    const responses = await Promise.all(
+      rounds.map((inRound) => {
+        const questions: Record<string, SemanticQuestion> = {}
+        for (const item of inRound) questions[item.key] = item.question
+        return provider.evaluate({
+          state,
+          questions,
+          ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+          ...(options.signal ? { signal: options.signal } : {}),
+        })
+      }),
+    )
 
-      const response = await provider.evaluate({
-        state,
-        questions,
-        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-        ...(options.signal ? { signal: options.signal } : {}),
-      })
+    const collected: Record<string, SemanticAnswer[]> = {}
+    for (const item of live) collected[item.key] = []
+    responses.forEach((response, round) => {
       requestCount++
       usage.inputTokens += response.usage?.inputTokens ?? 0
       usage.outputTokens += response.usage?.outputTokens ?? 0
-
-      for (const item of inRound) {
+      for (const item of rounds[round]!) {
         const answer = response.answers[item.key]
-        if (!answer) throw new Error(`Provider "${provider.name}" returned no answer for key "${item.key}".`)
-        rounds[item.key]!.push(answer)
+        if (!answer) throw new ProviderError(`Provider "${provider.name}" returned no answer for key "${item.key}".`)
+        if (answer.kind !== item.question.kind) {
+          throw new ProviderError(
+            `Provider "${provider.name}" answered "${item.key}" as ${answer.kind}, but it was asked as ${item.question.kind}.`,
+          )
+        }
+        collected[item.key]!.push(answer)
       }
-    }
+    })
 
     for (const item of live) {
-      const collected = rounds[item.key]!
-      answers[item.key] = aggregate(item.question.kind, collected)
-      measured[item.key] = collected.length > 1 ? confidenceFromSpread(series(item.question.kind, collected)) : undefined
+      const samples = collected[item.key]!
+      const answer = aggregate(item.question, samples)
+      const confidence = samples.length > 1 ? confidenceFromSpread(series(item.question, samples)) : undefined
+      answers[item.key] = answer
+      measured[item.key] = confidence
       if (item.cacheTtlMs && item.cacheTtlMs > 0) {
-        await store.set(cacheKeyFor(provider, state, item.question, item.samples), answers[item.key]!, item.cacheTtlMs)
+        const entry: CachedAnswer = confidence !== undefined ? { ...answer, measuredConfidence: confidence } : answer
+        await store.set(cacheKeyFor(provider, state, item.question, item.samples), entry, item.cacheTtlMs)
       }
     }
   }

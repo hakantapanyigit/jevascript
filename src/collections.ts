@@ -1,4 +1,4 @@
-import { BUILTIN_DEFAULTS, globalRuntime, type Runtime } from "./config.ts"
+import { BUILTIN_DEFAULTS, globalRuntime, resolveTimeout, type Runtime } from "./config.ts"
 import { emit as emitEvent, runPlan as runPlanRaw } from "./runner.ts"
 import { parseTtlOrUndefined } from "./internal.ts"
 import type { ChoiceAnswer, SemanticProvider, State, TruthAnswer } from "./types.ts"
@@ -37,13 +37,33 @@ function render<T>(item: T, index: number, label?: (item: never, index: number) 
   return JSON.stringify(item)
 }
 
-async function mapLimited<T, R>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length)
+/**
+ * Runs `fn` over `items` with at most `limit` in flight.
+ *
+ * Stops handing out new items as soon as one fails or `stop()` returns true,
+ * so a failing provider or an already-decided `some()` does not keep spending
+ * requests. Items never started are left `undefined`.
+ */
+async function mapLimited<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+  stop: (result: R) => boolean = () => false,
+): Promise<(R | undefined)[]> {
+  const results = new Array<R | undefined>(items.length)
   let cursor = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
+  let halted = false
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (!halted && cursor < items.length) {
       const index = cursor++
-      results[index] = await fn(items[index]!, index)
+      try {
+        const result = await fn(items[index]!, index)
+        results[index] = result
+        if (stop(result)) halted = true
+      } catch (error) {
+        halted = true
+        throw error
+      }
     }
   })
   await Promise.all(workers)
@@ -68,57 +88,78 @@ export function bindCollections(runtime: Runtime): Collections {
   const emit = (event: Parameters<typeof emitEvent>[0]) => emitEvent(event, runtime.config)
   const runPlan: typeof runPlanRaw = (provider, state, planned, options = {}) =>
     runPlanRaw(provider, state, planned, { ...options, store: runtime.store })
+  const thresholdOf = (options: { threshold?: number }) =>
+    options.threshold ?? getConfig().defaults?.threshold ?? BUILTIN_DEFAULTS.threshold
+  const timeoutOf = (options: { timeoutMs?: number }) => {
+    const timeoutMs = resolveTimeout(options.timeoutMs, getConfig())
+    return timeoutMs !== undefined ? { timeoutMs } : {}
+  }
 
 /**
- * Scores every item independently against one proposition.
+ * Scores items independently against one proposition.
  *
  * This is N requests, not one: each item is a different state, and a request
  * carries a single state. Prefer `find` when you only need the best item.
+ * `stopWhen` ends the walk early once the answer is decided.
  */
 async function scoreEach<T>(
   items: readonly T[],
   condition: string,
   options: RankOptions | (CollectionOptions & { by: string; trueWhen?: string; falseWhen?: string }),
   operation: "filter" | "rank" | "find" | "compare",
-): Promise<number[]> {
+  stopWhen?: (probability: number) => boolean,
+): Promise<(number | undefined)[]> {
   const provider = resolveProvider(options.provider)
   const ttl = parseTtlOrUndefined(options.cache ?? getConfig().defaults?.cache)
+  const samples = options.samples ?? 1
   const started = Date.now()
-  const scores = await mapLimited(items, options.concurrency ?? 8, async (item, index) => {
-    const rendered = render(item, index, options.label)
-    const shared = (options as { context?: State }).context
-    const state: State = shared === undefined ? rendered : { context: shared, candidate: rendered }
-    const result = await runPlan(
-      provider,
-      state,
-      [
-        {
-          key: "match",
-          question: {
-            kind: "truth",
-            instructions: condition,
-            ...(options.trueWhen !== undefined ? { trueWhen: options.trueWhen } : {}),
-            ...(options.falseWhen !== undefined ? { falseWhen: options.falseWhen } : {}),
+  const totals = { requests: 0, cached: 0, inputTokens: 0, outputTokens: 0 }
+  const scores = await mapLimited(
+    items,
+    options.concurrency ?? 8,
+    async (item, index) => {
+      const rendered = render(item, index, options.label)
+      const shared = (options as { context?: State }).context
+      const state: State = shared === undefined ? rendered : { context: shared, candidate: rendered }
+      const result = await runPlan(
+        provider,
+        state,
+        [
+          {
+            key: "match",
+            question: {
+              kind: "truth",
+              instructions: condition,
+              ...(options.trueWhen !== undefined ? { trueWhen: options.trueWhen } : {}),
+              ...(options.falseWhen !== undefined ? { falseWhen: options.falseWhen } : {}),
+            },
+            samples,
+            ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
           },
-          samples: options.samples ?? 1,
-          ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
-        },
-      ],
-      options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {},
-    )
-    return (result.answers["match"] as TruthAnswer).probability
-  })
+        ],
+        timeoutOf(options),
+      )
+      totals.requests += result.requestCount
+      totals.cached += result.cachedKeys.size
+      totals.inputTokens += result.usage.inputTokens ?? 0
+      totals.outputTokens += result.usage.outputTokens ?? 0
+      return (result.answers["match"] as TruthAnswer).probability
+    },
+    stopWhen,
+  )
+  const evaluated = scores.filter((s) => s !== undefined).length
   emit({
     operation,
     keys: ["match"],
     provider: provider.name,
     model: provider.model,
     latencyMs: Date.now() - started,
-    cached: false,
+    cached: evaluated > 0 && totals.cached === evaluated,
     batched: false,
-    questionCount: items.length,
-    requestCount: items.length * (options.samples ?? 1),
-    samples: options.samples ?? 1,
+    questionCount: evaluated,
+    requestCount: totals.requests,
+    samples,
+    usage: { inputTokens: totals.inputTokens, outputTokens: totals.outputTokens },
   })
   return scores
 }
@@ -130,17 +171,24 @@ async function filter<T>(
 ): Promise<T[]> {
   if (items.length === 0) return []
   const scores = await scoreEach(items, condition, { ...options, by: condition }, "filter")
-  const threshold = options.threshold ?? getConfig().defaults?.threshold ?? BUILTIN_DEFAULTS.threshold
+  const threshold = thresholdOf(options)
   return items.filter((_, index) => scores[index]! > threshold)
 }
 
+/** Stops at the first match: at best one request, at worst N. */
 async function some<T>(items: readonly T[], condition: string, options: CollectionOptions = {}): Promise<boolean> {
-  return (await filter(items, condition, options)).length > 0
+  if (items.length === 0) return false
+  const threshold = thresholdOf(options)
+  const scores = await scoreEach(items, condition, { ...options, by: condition }, "filter", (p) => p > threshold)
+  return scores.some((p) => p !== undefined && p > threshold)
 }
 
+/** Stops at the first item that fails. */
 async function every<T>(items: readonly T[], condition: string, options: CollectionOptions = {}): Promise<boolean> {
   if (items.length === 0) return true
-  return (await filter(items, condition, options)).length === items.length
+  const threshold = thresholdOf(options)
+  const scores = await scoreEach(items, condition, { ...options, by: condition }, "filter", (p) => p <= threshold)
+  return scores.every((p) => p !== undefined && p > threshold)
 }
 
 async function rank<T>(items: readonly T[], options: RankOptions): Promise<Ranked<T>[]> {
@@ -167,21 +215,22 @@ async function find<T>(
   if (items.length === 0) return undefined
   const provider = resolveProvider(options.provider)
   const capacity = provider.capabilities.maxChoiceOptions
+  const threshold = thresholdOf(options)
 
   if (items.length > capacity) {
     const ranked = await rank(items, { ...options, by: condition })
     const best = ranked[0]
-    const threshold = options.threshold ?? getConfig().defaults?.threshold ?? BUILTIN_DEFAULTS.threshold
     return best && best.score > threshold ? best.item : undefined
   }
 
+  // Measured against the live API: the candidates belong both in the state
+  // (the existence check reads them there) and as the option descriptions
+  // (bare ids lose accuracy). Moving the text out of either costs correctness
+  // and saves almost no tokens.
   const ids = items.map((_, index) => `i${index}`)
-  const optionMap: Record<string, string> = {}
   const candidates: Record<string, string> = {}
   items.forEach((item, index) => {
-    const text = render(item, index, options.label)
-    optionMap[ids[index]!] = text
-    candidates[ids[index]!] = text
+    candidates[ids[index]!] = render(item, index, options.label)
   })
 
   const ttl = parseTtlOrUndefined(options.cache ?? getConfig().defaults?.cache)
@@ -192,7 +241,7 @@ async function find<T>(
     [
       {
         key: "pick",
-        question: { kind: "choice", instructions: condition, options: optionMap },
+        question: { kind: "choice", instructions: condition, options: candidates },
         samples: options.samples ?? 1,
         ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
       },
@@ -207,7 +256,7 @@ async function find<T>(
         ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
       },
     ],
-    options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {},
+    timeoutOf(options),
   )
 
   emit({
@@ -224,7 +273,6 @@ async function find<T>(
     usage: result.usage,
   })
 
-  const threshold = options.threshold ?? getConfig().defaults?.threshold ?? BUILTIN_DEFAULTS.threshold
   if ((result.answers["exists"] as TruthAnswer).probability <= threshold) return undefined
   const picked = (result.answers["pick"] as ChoiceAnswer).choice
   const index = ids.indexOf(picked)
@@ -239,6 +287,7 @@ async function compare<T>(
 ): Promise<Comparison> {
   const provider = resolveProvider(options.provider)
   const toText = (item: T) => (options.label ? options.label(item) : typeof item === "string" ? item : JSON.stringify(item))
+  const ttl = parseTtlOrUndefined(options.cache ?? getConfig().defaults?.cache)
   const started = Date.now()
   const result = await runPlan(
     provider,
@@ -256,9 +305,10 @@ async function compare<T>(
           },
         },
         samples: options.samples ?? 1,
+        ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
       },
     ],
-    options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {},
+    timeoutOf(options),
   )
   emit({
     operation: "compare",
@@ -266,7 +316,7 @@ async function compare<T>(
     provider: provider.name,
     model: provider.model,
     latencyMs: Date.now() - started,
-    cached: false,
+    cached: result.cachedKeys.size === 1,
     batched: false,
     questionCount: 1,
     requestCount: result.requestCount,

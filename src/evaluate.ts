@@ -1,9 +1,10 @@
-import { BUILTIN_DEFAULTS, globalRuntime, type Runtime } from "./config.ts"
+import { BUILTIN_DEFAULTS, globalRuntime, resolveTimeout, type Runtime } from "./config.ts"
 import { emit, runPlan, type PlannedQuestion } from "./runner.ts"
 import { parseTtlOrUndefined } from "./internal.ts"
+import { toRange } from "./interpret.ts"
 import { DEFAULT_SCORE_FRAME } from "./questions.ts"
 import type { AnyOutput, ObjectOutput, OutputValue } from "./outputs.ts"
-import type { ChoiceAnswer, LevelAnswer, SemanticProvider, SemanticQuestion, State, TruthAnswer } from "./types.ts"
+import type { ChoiceAnswer, SemanticProvider, SemanticQuestion, State, TruthAnswer } from "./types.ts"
 
 export interface EvaluateRequest<O extends AnyOutput> {
   data: State
@@ -53,7 +54,11 @@ function collect(output: AnyOutput, path: string[], into: Leaf[]): void {
     for (const [name, field] of Object.entries(output.fields)) collect(field, [...path, name], into)
     return
   }
-  const key = path.length === 0 ? "value" : path.join("__")
+  // Readable keys where possible, but `{ a__b }` and `{ a: { b } }` must not
+  // share one: a collision would silently answer one field with the other.
+  const base = path.length === 0 ? "value" : path.join("__")
+  let key = base
+  for (let n = 2; into.some((leaf) => leaf.key === key); n++) key = `${base}_${n}`
   const instructions = instructionsFor(path, output.describe, output.kind)
   if (output.kind === "boolean") {
     into.push({
@@ -126,11 +131,12 @@ export async function evaluateWith<O extends AnyOutput>(runtime: Runtime, reques
     ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
   }))
 
+  const timeoutMs = resolveTimeout(request.timeoutMs, runtime.config)
   const result = await runPlan(
     provider,
     state,
     planned,
-    { store: runtime.store, ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}) },
+    { store: runtime.store, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
   )
 
   emit({
@@ -160,14 +166,7 @@ export async function evaluateWith<O extends AnyOutput>(runtime: Runtime, reques
     } else if (leaf.output.kind === "enum") {
       value = (answer as ChoiceAnswer).choice
     } else {
-      const { min, max } = leaf.output
-      if (answer.kind === "level") {
-        const width = (answer as LevelAnswer).probabilities.length
-        const position = width > 1 ? (answer as LevelAnswer).level / (width - 1) : 0
-        value = min + position * (max - min)
-      } else {
-        value = min + (answer as TruthAnswer).probability * (max - min)
-      }
+      value = toRange(leaf.question, answer, [leaf.output.min, leaf.output.max])
     }
     if (leaf.path.length === 0) scalar = value
     else assign(root, leaf.path, value)

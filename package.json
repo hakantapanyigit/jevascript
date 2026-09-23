@@ -1,24 +1,51 @@
 {
   "name": "jevascript",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Semantic values for deterministic TypeScript: is, score and choose as ordinary values, backed by a decision model.",
   "license": "MIT",
+  "author": "Hakan Tapanyiğit (https://github.com/hakantapanyigit)",
   "homepage": "https://jevascript.org",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakantapanyigit/jevascript.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hakantapanyigit/jevascript/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./testing": { "types": "./dist/testing.d.ts", "default": "./dist/testing.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
-  "engines": { "node": ">=22.6" },
-  "keywords": ["llm", "semantic", "decision-model", "jev", "typescript", "classification", "scoring"],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "keywords": [
+    "llm",
+    "semantic",
+    "decision-model",
+    "jev",
+    "typescript",
+    "classification",
+    "scoring"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "npm run build && tsc -p tsconfig.test.json",
     "test": "npm run typecheck && node --test test/*.test.ts",
+    "test:live": "npm run build && node --env-file-if-exists=.env --test test/live/*.test.ts",
     "example": "node --env-file=.env --experimental-strip-types",
     "prepublishOnly": "npm test"
   },

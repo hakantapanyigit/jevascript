@@ -3,10 +3,18 @@ import { semanticContext } from "./factory.ts"
 import { bindCollections, type Collections } from "./collections.ts"
 import { createRuntime, globalRuntime, type Runtime, type SemanticConfig } from "./config.ts"
 import { evaluateWith, type EvaluateRequest } from "./evaluate.ts"
-import { defineMetricWith, defineRuleWith, type Metric, type MetricDefinition, type Rule, type RuleDefinition } from "./define.ts"
+import {
+  defineMetricWith,
+  defineRuleWith,
+  type Metric,
+  type MetricDefinition,
+  type Rule,
+  type RuleDefinition,
+  type RuleValue,
+} from "./define.ts"
 import { defineSchemaWith, type Evaluator, type SchemaDefinition } from "./schema.ts"
 import type { AnyOutput, OutputValue } from "./outputs.ts"
-import { score as questionScore, type QuestionSpec, type ScoreOptions } from "./questions.ts"
+import { score as questionScore, type QuestionSpec, type ScoreOptions, type ScoreResult } from "./questions.ts"
 import { numberRange, type NumberOutput } from "./outputs.ts"
 import type { State } from "./types.ts"
 
@@ -15,7 +23,7 @@ export interface Semantic extends Collections {
   (state: State): SemanticContext
   evaluate<O extends AnyOutput>(request: EvaluateRequest<O>): Promise<OutputValue<O>>
   defineMetric(definition: MetricDefinition): Metric
-  defineRule(definition: RuleDefinition): Rule
+  defineRule<const D extends RuleDefinition>(definition: D): Rule<RuleValue<D>>
   defineSchema<const O extends AnyOutput>(definition: SchemaDefinition<O>): Evaluator<O>
   /** The configuration this instance runs with. */
   readonly config: SemanticConfig
@@ -31,7 +39,7 @@ function bind(runtime: Runtime): Semantic {
   return Object.assign(fn, bindCollections(runtime), {
     evaluate: <O extends AnyOutput>(request: EvaluateRequest<O>) => evaluateWith(runtime, request),
     defineMetric: (definition: MetricDefinition) => defineMetricWith(runtime, definition),
-    defineRule: (definition: RuleDefinition) => defineRuleWith(runtime, definition),
+    defineRule: <const D extends RuleDefinition>(definition: D) => defineRuleWith(runtime, definition),
     defineSchema: <const O extends AnyOutput>(definition: SchemaDefinition<O>) => defineSchemaWith(runtime, definition),
     configure: (config: SemanticConfig) => runtime.configure(config),
     get config() {
@@ -61,19 +69,18 @@ export const semantic: Semantic = bind(globalRuntime)
  * As a question — `score("urgency")` — it composes into `batch()`.
  * As an output shape — `score(0, 100)` — it describes a field for `evaluate()`.
  */
-export function score(criterion: string, options?: ScoreOptions): QuestionSpec<number>
+export function score<O extends ScoreOptions = {}>(criterion: string, options?: O): QuestionSpec<ScoreResult<O>>
 export function score(min?: number, max?: number, describe?: string): NumberOutput
 export function score(
   a?: string | number,
   b?: ScoreOptions | number,
   c?: string,
-): QuestionSpec<number> | NumberOutput {
+): QuestionSpec<unknown> | NumberOutput {
   if (typeof a === "string") return questionScore(a, (b as ScoreOptions) ?? {})
   return numberRange(a ?? 0, (b as number) ?? 100, c)
 }
 
 export { SemanticContext } from "./context.ts"
-export type { DetailedChoice, DetailedScore, DetailedTruth } from "./context.ts"
 
 export { configureSemantic, resetSemantic, getConfig, createRuntime, BUILTIN_DEFAULTS } from "./config.ts"
 export type { SemanticConfig, SemanticDefaults, Runtime } from "./config.ts"
@@ -81,12 +88,20 @@ export type { SemanticConfig, SemanticDefaults, Runtime } from "./config.ts"
 export { choose, is, DEFAULT_SCORE_FRAME } from "./questions.ts"
 export type {
   ChoiceInput,
+  ChoiceKey,
   ChooseOptions,
+  ChooseResult,
+  DetailedChoice,
+  DetailedScore,
+  DetailedTruth,
   IsOptions,
+  IsResult,
   QuestionSpec,
   ScoreOptions,
+  ScoreResult,
   SharedOptions,
   TruthCriteria,
+  TruthValue,
 } from "./questions.ts"
 
 export { evaluate, evaluateWith } from "./evaluate.ts"
@@ -103,7 +118,16 @@ export type {
 } from "./outputs.ts"
 
 export { defineMetric, defineRule, defineMetricWith, defineRuleWith } from "./define.ts"
-export type { Metric, MetricDefinition, Rule, RuleDefinition } from "./define.ts"
+export type {
+  Metric,
+  MetricDefinition,
+  MetricOptions,
+  Rule,
+  RuleDefaults,
+  RuleDefinition,
+  RuleOptions,
+  RuleValue,
+} from "./define.ts"
 
 export { compare, every, filter, find, some, rank, bindCollections } from "./collections.ts"
 export type { Collections, CollectionOptions, Comparison, Ranked, RankOptions } from "./collections.ts"
@@ -119,6 +143,7 @@ export {
   NotConfiguredError,
   ProviderError,
   SemanticError,
+  SemanticTimeoutError,
   SemanticValidationError,
   UnsupportedByProviderError,
 } from "./errors.ts"

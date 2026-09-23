@@ -43,7 +43,8 @@ export function boolean(options: Omit<BooleanOutput, "kind"> = {}): BooleanOutpu
 }
 
 export function number(options: { min?: number; max?: number; describe?: string; levels?: readonly string[] } = {}): NumberOutput {
-  return { kind: "number", min: options.min ?? 0, max: options.max ?? 100, ...options }
+  // Spread first: an explicit `min: undefined` must not overwrite the default.
+  return { ...options, kind: "number", min: options.min ?? 0, max: options.max ?? 100 }
 }
 
 export function enumOf<const T extends readonly string[]>(options: T, describe?: string): EnumOutput<T[number]>

@@ -1,52 +1,28 @@
-import { BUILTIN_DEFAULTS, globalRuntime, shouldWarnUnbatched, type Runtime, type SemanticConfig } from "./config.ts"
-import { LowConfidenceError } from "./errors.ts"
+import { globalRuntime, resolveTimeout, shouldWarnUnbatched, type Runtime, type SemanticConfig } from "./config.ts"
 import { emit, runPlan, type PlannedQuestion } from "./runner.ts"
 import { bindCollections, type Ranked, type RankOptions } from "./collections.ts"
 import { parseTtlOrUndefined } from "./internal.ts"
+import { interpret, resolveSamples } from "./interpret.ts"
 import {
   DEFAULT_SCORE_FRAME,
   buildChoose,
   buildIs,
   buildScore,
+  type BuiltQuestion,
   type ChoiceInput,
+  type ChoiceKey,
   type ChooseOptions,
+  type ChooseResult,
   type IsOptions,
+  type IsResult,
   type QuestionSpec,
   type ScoreOptions,
+  type ScoreResult,
   type SharedOptions,
 } from "./questions.ts"
-import type {
-  ChoiceAnswer,
-  ChoiceOptionSpec,
-  LevelAnswer,
-  SemanticAnswer,
-  SemanticProvider,
-  SemanticQuestion,
-  State,
-  TruthAnswer,
-} from "./types.ts"
+import type { SemanticAnswer, SemanticProvider, SemanticQuestion, State } from "./types.ts"
 
-export interface DetailedTruth {
-  value: boolean
-  /** The calibrated signal. For truth-backed answers this *is* the uncertainty. */
-  probability: number
-  /** Measured across sample rounds. Undefined unless `samples`/`minConfidence` was set. */
-  confidence?: number
-}
-
-export interface DetailedScore {
-  value: number
-  probability?: number
-  /** Rubric position, 1-indexed. Present only for `levels`-backed scores. */
-  level?: number
-  confidence?: number
-}
-
-export interface DetailedChoice<T extends string> {
-  value: T
-  confidence: number
-  probabilities: Record<string, number>
-}
+export type { DetailedChoice, DetailedScore, DetailedTruth } from "./questions.ts"
 
 interface Pending {
   key: string
@@ -60,26 +36,6 @@ interface Pending {
 
 function scoreFrame(config: SemanticConfig): (criterion: string) => string {
   return config.defaults?.scoreFrame ?? DEFAULT_SCORE_FRAME
-}
-
-/** Rounds needed for this question. `minConfidence` implies measurement. */
-function resolveSamples(kind: SemanticQuestion["kind"], options: SharedOptions, config: SemanticConfig): number {
-  if (options.samples !== undefined) return Math.max(1, options.samples)
-  const needsMeasurement = options.minConfidence !== undefined && kind === "truth"
-  if (!needsMeasurement) return 1
-  return config.defaults?.samples ?? BUILTIN_DEFAULTS.samples
-}
-
-async function applyFallback<T>(
-  confidence: number | undefined,
-  minConfidence: number | undefined,
-  value: T,
-  fallback: T | (() => T | Promise<T>) | undefined,
-): Promise<T> {
-  if (minConfidence === undefined) return value
-  if (confidence !== undefined && confidence >= minConfidence) return value
-  if (fallback === undefined) throw new LowConfidenceError(confidence ?? 0, minConfidence, value)
-  return typeof fallback === "function" ? await (fallback as () => T | Promise<T>)() : fallback
 }
 
 export class SemanticContext {
@@ -118,7 +74,7 @@ export class SemanticContext {
     const planned: PlannedQuestion = {
       key,
       question,
-      samples: resolveSamples(question.kind, options, this.#config),
+      samples: resolveSamples(question.kind, options, this.#config.defaults),
       ...(ttl !== undefined ? { cacheTtlMs: ttl } : {}),
     }
     return new Promise((resolve, reject) => {
@@ -126,7 +82,7 @@ export class SemanticContext {
         key,
         provider,
         planned,
-        timeoutMs: options.timeoutMs ?? this.#config.defaults?.timeoutMs,
+        timeoutMs: resolveTimeout(options.timeoutMs, this.#config),
         metric: options.metric,
         settle: (answer, measured, cached) => resolve({ answer, measured, cached }),
         fail: reject,
@@ -172,13 +128,16 @@ export class SemanticContext {
 
     await Promise.all(
       [...byProvider].map(async ([provider, items]) => {
-        const timeouts = items.map((i) => i.timeoutMs).filter((t): t is number => t !== undefined)
+        // One request carries every question, so it runs under the most
+        // generous deadline among them — or none, if any asked for none.
+        const timeouts = items.map((i) => i.timeoutMs)
+        const timeoutMs = timeouts.includes(undefined) ? undefined : Math.max(...(timeouts as number[]))
         try {
           const result = await runPlan(
             provider,
             this.#state,
             items.map((i) => i.planned),
-            { store: this.#runtime.store, ...(timeouts.length > 0 ? { timeoutMs: Math.max(...timeouts) } : {}) },
+            { store: this.#runtime.store, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
           )
           // Only name the batch when every question came from the same
           // definition; a mixed batch has no single identity to report.
@@ -209,109 +168,35 @@ export class SemanticContext {
     )
   }
 
-  // -------------------------------------------------------------------------
-  // is()
-  // -------------------------------------------------------------------------
-
-  is(condition: string, options?: IsOptions & { detailed?: false; allowUnknown?: false }): Promise<boolean>
-  is(condition: string, options: IsOptions & { detailed: true }): Promise<DetailedTruth>
-  is(condition: string, options: IsOptions & { allowUnknown: true }): Promise<boolean | "unknown">
-  async is(condition: string, options: IsOptions = {}): Promise<boolean | "unknown" | DetailedTruth> {
-    const provider = this.#runtime.provider(options.provider)
-    const built = buildIs(condition, options)
-    const { answer, measured } = await this.#enqueue(provider, built.question, options)
-    const probability = (answer as TruthAnswer).probability
-    const defaults = this.#config.defaults
-
-    if (options.allowUnknown) {
-      const [low, high] = options.uncertaintyBand ?? defaults?.uncertaintyBand ?? BUILTIN_DEFAULTS.uncertaintyBand
-      if (probability >= low && probability <= high) return "unknown"
-    }
-
-    const threshold = options.threshold ?? defaults?.threshold ?? BUILTIN_DEFAULTS.threshold
-    const raw = probability > threshold
-    const value = await applyFallback(measured, options.minConfidence ?? defaults?.minConfidence, raw, options.fallback)
-
-    if (options.detailed) {
-      return { value, probability, ...(measured !== undefined ? { confidence: measured } : {}) }
-    }
-    return value
+  /** Sends one built question and interprets its answer. Every primitive goes through here. */
+  async #ask(built: BuiltQuestion): Promise<unknown> {
+    const provider = this.#runtime.provider(built.options.provider)
+    const { answer, measured } = await this.#enqueue(provider, built.question, built.options)
+    return interpret(built, answer, measured, this.#config.defaults)
   }
 
-  // -------------------------------------------------------------------------
-  // score()
-  // -------------------------------------------------------------------------
-
-  score(criterion: string, options?: ScoreOptions & { detailed?: false }): Promise<number>
-  score(criterion: string, options: ScoreOptions & { detailed: true }): Promise<DetailedScore>
-  async score(criterion: string, options: ScoreOptions = {}): Promise<number | DetailedScore> {
-    const provider = this.#runtime.provider(options.provider)
-    const built = buildScore(criterion, options, scoreFrame(this.#config))
-    const { answer, measured } = await this.#enqueue(provider, built.question, options)
-    const [min, max] = built.range
-    const defaults = this.#config.defaults
-
-    let raw: number
-    let detail: DetailedScore
-    if (answer.kind === "level") {
-      const levels = (answer as LevelAnswer).probabilities.length
-      const position = levels > 1 ? (answer as LevelAnswer).level / (levels - 1) : 0
-      raw = min + position * (max - min)
-      detail = { value: raw, level: (answer as LevelAnswer).level, confidence: (answer as LevelAnswer).confidence }
-    } else {
-      const probability = (answer as TruthAnswer).probability
-      raw = min + probability * (max - min)
-      detail = { value: raw, probability, ...(measured !== undefined ? { confidence: measured } : {}) }
-    }
-
-    const value = await applyFallback(
-      detail.confidence,
-      options.minConfidence ?? defaults?.minConfidence,
-      raw,
-      options.fallback,
-    )
-    return options.detailed ? { ...detail, value } : value
+  /**
+   * P(condition) thresholded into a boolean.
+   *
+   * `allowUnknown: true` widens the result to `boolean | "unknown"`, and
+   * `detailed: true` returns the probability alongside — the types follow.
+   */
+  is<O extends IsOptions = {}>(condition: string, options?: O): Promise<IsResult<O>> {
+    return this.#ask(buildIs(condition, options ?? {})) as Promise<IsResult<O>>
   }
 
-  // -------------------------------------------------------------------------
-  // choose()
-  // -------------------------------------------------------------------------
-
-  choose<const T extends readonly string[]>(
-    options: T,
-    extra?: ChooseOptions & { detailed?: false },
-  ): Promise<T[number]>
-  choose<const T extends readonly string[]>(
-    options: T,
-    extra: ChooseOptions & { detailed: true },
-  ): Promise<DetailedChoice<T[number]>>
-  choose<const T extends Readonly<Record<string, string | ChoiceOptionSpec>>>(
-    options: T,
-    extra?: ChooseOptions & { detailed?: false },
-  ): Promise<keyof T & string>
-  choose<const T extends Readonly<Record<string, string | ChoiceOptionSpec>>>(
-    options: T,
-    extra: ChooseOptions & { detailed: true },
-  ): Promise<DetailedChoice<keyof T & string>>
-  async choose(input: ChoiceInput, extra: ChooseOptions = {}): Promise<string | DetailedChoice<string>> {
-    const provider = this.#runtime.provider(extra.provider)
-    const built = buildChoose(input, extra)
-    const { answer } = await this.#enqueue(provider, built.question, extra)
-    const choice = answer as ChoiceAnswer
-    const value = await applyFallback(
-      choice.confidence,
-      extra.minConfidence ?? this.#config.defaults?.minConfidence,
-      choice.choice,
-      extra.fallback,
-    )
-    return extra.detailed
-      ? { value, confidence: choice.confidence, probabilities: { ...choice.probabilities } }
-      : value
+  /** A probability- or rubric-backed number on `range` (0–100 by default). */
+  score<O extends ScoreOptions = {}>(criterion: string, options?: O): Promise<ScoreResult<O>> {
+    return this.#ask(buildScore(criterion, options ?? {}, scoreFrame(this.#config))) as Promise<ScoreResult<O>>
   }
 
-  // -------------------------------------------------------------------------
-  // rank()
-  // -------------------------------------------------------------------------
+  /** Exactly one of the options. The literal union is inferred without `as const`. */
+  choose<const T extends ChoiceInput, O extends ChooseOptions = {}>(
+    options: T,
+    extra?: O,
+  ): Promise<ChooseResult<ChoiceKey<T>, O>> {
+    return this.#ask(buildChoose(options, extra ?? {})) as Promise<ChooseResult<ChoiceKey<T>, O>>
+  }
 
   /**
    * Orders items by how well they fit this state.
@@ -324,64 +209,24 @@ export class SemanticContext {
     return bindCollections(this.#runtime).rank(items, { ...options, context: this.#state } as RankOptions)
   }
 
-  // -------------------------------------------------------------------------
-  // batch()
-  // -------------------------------------------------------------------------
-
   /**
    * Evaluates every question against this state in a single request.
    *
    * Equivalent to creating the same questions in one turn and awaiting them
-   * together; this form just makes the intent explicit and names the results.
+   * together — including every option: thresholds, `allowUnknown`,
+   * `minConfidence` and `fallback`, `detailed`. This form just makes the
+   * intent explicit and names the results.
    */
   async batch<S extends Record<string, QuestionSpec>>(
     spec: S,
   ): Promise<{ [K in keyof S]: S[K] extends QuestionSpec<infer V> ? V : never }> {
     const frame = scoreFrame(this.#config)
     const entries = Object.entries(spec)
-    const results = await Promise.all(
-      entries.map(async ([, questionSpec]) => {
-        const built = questionSpec.build(frame)
-        const provider = this.#runtime.provider(built.options.provider)
-        const { answer, measured } = await this.#enqueue(
-          provider,
-          built.question as SemanticQuestion,
-          built.options,
-        )
-        return this.#interpret(built, answer, measured)
-      }),
-    )
+    const results = await Promise.all(entries.map(([, questionSpec]) => this.#ask(questionSpec.build(frame))))
     const output: Record<string, unknown> = {}
     entries.forEach(([key], index) => {
       output[key] = results[index]
     })
     return output as never
-  }
-
-  #interpret(
-    built: ReturnType<QuestionSpec["build"]>,
-    answer: SemanticAnswer,
-    measured: number | undefined,
-  ): unknown {
-    const defaults = this.#config.defaults
-    if (built.operation === "choose") return (answer as ChoiceAnswer).choice
-    if (built.operation === "is") {
-      const options = built.options as IsOptions
-      const probability = (answer as TruthAnswer).probability
-      if (options.allowUnknown) {
-        const [low, high] =
-          options.uncertaintyBand ?? defaults?.uncertaintyBand ?? BUILTIN_DEFAULTS.uncertaintyBand
-        if (probability >= low && probability <= high) return "unknown"
-      }
-      return probability > (options.threshold ?? defaults?.threshold ?? BUILTIN_DEFAULTS.threshold)
-    }
-    const [min, max] = built.range ?? [0, 100]
-    if (answer.kind === "level") {
-      const levels = (answer as LevelAnswer).probabilities.length
-      const position = levels > 1 ? (answer as LevelAnswer).level / (levels - 1) : 0
-      return min + position * (max - min)
-    }
-    void measured
-    return min + (answer as TruthAnswer).probability * (max - min)
   }
 }

@@ -1,9 +1,14 @@
 import { MemoryCache, type SemanticCache } from "./cache.ts"
 import { NotConfiguredError } from "./errors.ts"
+import { env } from "./env.ts"
 import { jev } from "./providers/jev.ts"
 import type { Observability, SemanticProvider } from "./types.ts"
 
 export interface SemanticDefaults {
+  /**
+   * Deadline for one evaluation, retries included. Defaults to 10 000. Pass `0`
+   * or `Infinity` to wait indefinitely.
+   */
   timeoutMs?: number
   minConfidence?: number
   cache?: string | number
@@ -56,7 +61,7 @@ function resolveProviderIn(config: SemanticConfig, override?: SemanticProvider):
   if (override) return override
   if (config.provider) return config.provider
   // Zero-config path: an API key in the environment is enough to start.
-  if (process.env["JEV_API_KEY"]) {
+  if (env("JEV_API_KEY")) {
     config.provider = jev()
     return config.provider
   }
@@ -119,5 +124,11 @@ export function resolveProvider(override?: SemanticProvider): SemanticProvider {
 }
 
 export function shouldWarnUnbatched(config: SemanticConfig = current): boolean {
-  return config.warnUnbatched ?? process.env["NODE_ENV"] !== "production"
+  return config.warnUnbatched ?? env("NODE_ENV") !== "production"
+}
+
+/** The deadline a call runs under: its own, else the configured default, else the built-in one. */
+export function resolveTimeout(explicit: number | undefined, config: SemanticConfig): number | undefined {
+  const timeoutMs = explicit ?? config.defaults?.timeoutMs ?? BUILTIN_DEFAULTS.timeoutMs
+  return timeoutMs > 0 && Number.isFinite(timeoutMs) ? timeoutMs : undefined
 }

@@ -16,11 +16,14 @@ if (urgency > 80) {
 
 The model supplies the judgement. Your code decides the consequence.
 
+**[Website](https://jevascript.org/)** · **[Documentation](https://jevascript.org/docs)** ·
+**[Changelog](CHANGELOG.md)**
+
 ## Status
 
-Working MVP. The package is verified end to end against the live
-TypeSafe API. Several items from the design doc are deliberately not built yet — see
-[Not yet built](#not-yet-built).
+Working MVP, 0.x: the API may still change before 1.0. The package is verified end to end
+against the live TypeSafe API. Several planned features are deliberately not built yet — see
+the [roadmap](#roadmap).
 
 ## Install
 
@@ -109,6 +112,11 @@ const analysis = await semantic(ticket).batch({
 })
 ```
 
+A question means the same thing in a batch as on its own: `threshold`, `allowUnknown`,
+`minConfidence` with `fallback`, and `detailed` all apply, and the result types follow the
+options — `is("…", { allowUnknown: true })` is typed `boolean | "unknown"`, never a bare
+`boolean` that would let a truthy `"unknown"` through an `if`.
+
 `Promise.all([...])` on the same context batches identically. **Sequential `await`s cannot**
 — the second question doesn't exist until the first resolves — so the runtime warns once
 when a context issues a second request.
@@ -168,7 +176,9 @@ const risk = await semantic(order).score("fraud risk", {
 Without `minConfidence` or `samples`, `detailed: true` returns `probability` and leaves
 `confidence` undefined rather than filling it with a number that means nothing. Sampling a
 question does not multiply the cost of its neighbours: the extra rounds carry only the
-questions that asked for them.
+questions that asked for them. The rounds run concurrently, so sampling costs requests, not
+latency. A `minConfidence` set in `defaults` implies sampling just as one set on the call
+does, and a cached answer keeps the confidence it was measured with.
 
 `choose()` and rubric-backed `score()` get a real confidence from the provider — the
 concentration of the distribution — so they need no sampling.
@@ -190,7 +200,19 @@ switch (await semantic(tx).is("This is fraud", { allowUnknown: true })) {
 await semantic(doc).score("quality", { cache: "1h" })
 ```
 
-Caching is a consistency tool here as much as a cost one.
+Caching is a consistency tool here as much as a cost one. Cache keys are SHA-256 over exactly
+what the provider is sent (`Date`s included), so two states can only share an answer if the
+model would have seen the same thing.
+
+## Timeouts and failures
+
+Every evaluation runs under one deadline — 10 s unless `defaults.timeoutMs` or the call's
+`timeoutMs` says otherwise, `0` for none. Retries on 429/5xx spend from that deadline rather
+than each getting a fresh one, and a timeout or a caller's `AbortSignal` is never retried.
+A timeout throws `SemanticTimeoutError`; any other provider failure throws `ProviderError`
+with the HTTP `status` and the API's own message. Answers are validated on the way in: a
+choice that is not one of your options, or a probability outside [0, 1], is an error rather
+than a value.
 
 ## Declare a schema once, apply it to data
 
@@ -266,6 +288,14 @@ if (await churnRisk(customer) > 80) startRetentionFlow()
 
 `churnRisk.question()` composes into `batch()`, so a defined metric still shares a request.
 
+`defineRule` is the boolean counterpart. Whether a rule may answer `"unknown"` is part of its
+definition, and its type says so:
+
+```ts
+const fraud = defineRule({ name: "fraud", condition: "This order is fraudulent.", defaults: { allowUnknown: true } })
+const verdict = await fraud(order)   // boolean | "unknown"
+```
+
 Bump `version` whenever the wording changes. There is no fine-tuning: the prompt, the
 criteria and the pinned model version are a single artefact, and evaluations are only
 comparable within one.
@@ -278,7 +308,8 @@ Call cost differs by an order of magnitude, so it is worth knowing which you are
 |---|---|
 | `semantic.find(items, condition)` | **1** |
 | `semantic.compare(a, b, { by })` | **1** |
-| `semantic.filter` / `some` / `every` | N |
+| `semantic.filter` | N |
+| `semantic.some` / `every` | 1 to N — they stop as soon as the answer is decided |
 | `semantic(query).rank(items, { by })` | N |
 
 `find` puts the items themselves into one choice — and pairs it with an existence check,
@@ -370,9 +401,9 @@ Counting, arithmetic, and date comparison — a decision model reads dates as te
 ordered values. Extract the parts with a `choose`, then compare in code. Keep irrelevant
 fields out of the state; they measurably degrade accuracy.
 
-## Not yet built
+## Roadmap
 
-From the design document, deliberately out of scope for this MVP:
+Planned, and deliberately out of scope for this MVP:
 
 - `evidence` — the provider generates no text, so this has to be *extractive*: tag the state's
   lines with ids, run a choice over the ids plus an existence check, and cite the winning
@@ -430,7 +461,8 @@ npm run example examples/agent-guardrail.ts
 
 ```bash
 npm install
-npm test                                        # build + typecheck + 53 tests, no network
+npm test                                        # build + typecheck + 89 tests, no network
+npm run test:live                               # 10 contract tests against the live API, needs .env
 npm run example examples/support-ticket.ts      # live, needs JEV_API_KEY
 npm run example examples/batching-benchmark.ts
 ```
@@ -441,7 +473,15 @@ npm run example examples/batching-benchmark.ts
 src/              the runtime: context, batching, primitives, cache, definitions, collections
 src/providers/    provider adapters (jev.ts today)
 src/testing.ts    mock provider, exported as "jevascript/testing"
-test/             offline tests against the mock provider
+test/             offline tests against the mock provider and a scripted fetch
+test/live/        contract tests against the live API (npm run test:live)
 examples/         live end-to-end scripts (quick/, launch/, app/)
-docs/             landing page spec
 ```
+
+## Security
+
+Found a vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)
